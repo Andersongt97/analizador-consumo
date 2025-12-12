@@ -49,3 +49,12 @@ def picos_industrial():
 @router.get("/actual/estadisticas-sam")
 def estadisticas_sam():
     return estadisticas(df_sam["Consumo"])
+
+@router.get("/datos-industrial")
+def datos_industrial():
+    """
+    Devuelve todos los registros crudos de la hoja
+    'SETOR INDUSTRIAL POR RG' para análisis en Streamlit.
+    """
+    return df_ind.to_dict(orient="records")
+
