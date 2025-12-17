@@ -1,13 +1,17 @@
 import os
+import json
+from io import BytesIO
+
 import streamlit as st
 import requests
 import pandas as pd
 import plotly.express as px
-from io import BytesIO
 import qrcode
 
-# (Opcional) solo si usarás geopandas para validar/leer geojson
-import json
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
+from reportlab.lib.units import inch
 
 # ============================
 # CONFIGURACIÓN
@@ -15,20 +19,61 @@ import json
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 DASHBOARD_URL = os.getenv("DASHBOARD_URL", "http://localhost:8501")
 
-# GeoJSON del mapa (debes tenerlo local)
+# GeoJSON
 GEOJSON_PATH = os.getenv("GEOJSON_PATH", "data/br_states.geojson")
-
-# Clave dentro del geojson para enlazar con tu columna de ubicación
-# Ejemplo típico: "properties.sigla" o "properties.UF" o "properties.name"
 GEOJSON_KEY = os.getenv("GEOJSON_KEY", "properties.sigla")
+
+# Estilo de plotly
+TEMPLATE = "plotly_white"
+SEQ = px.colors.qualitative.Set2
+SEQ2 = px.colors.qualitative.Safe
+
+# ============================
+# UNIDADES (AQUÍ DEFINES MWh/GWh)
+# ============================
+UNIDAD_ORIGEN = "MWh"        # lo que trae la API/Excel (normalmente MWh)
+MOSTRAR_EN_GWH = True        # True: convertir MWh->GWh para mostrar
+
+def to_gwh(valor_mwh: float) -> float:
+    return valor_mwh / 1000.0
+
+def energia_display_series(series: pd.Series) -> pd.Series:
+    """Convierte una Serie de consumo para visualización (si aplica)."""
+    if MOSTRAR_EN_GWH:
+        return series / 1000.0
+    return series
+
+def unidad_txt() -> str:
+    return "GWh" if MOSTRAR_EN_GWH else UNIDAD_ORIGEN
+
+def fmt_energia(valor_mwh: float) -> str:
+    """Formatea un número de consumo (valor base MWh)."""
+    if MOSTRAR_EN_GWH:
+        return f"{to_gwh(valor_mwh):,.2f} GWh"
+    return f"{valor_mwh:,.2f} {UNIDAD_ORIGEN}"
 
 st.set_page_config(page_title="Dashboard Energético Brasil", layout="wide")
 
-st.title("📊 Dashboard de Consumo Energético por Región - Brasil")
+# --- Estilo (tu tema oscuro) ---
+st.markdown("""
+<style>
+.stApp { background-color: #2F2F31; }
+div[data-testid="stMetric"] {
+    background: #3b3b3f;
+    padding: 14px;
+    border-radius: 14px;
+    border: 1px solid #5a5a60;
+}
+h1, h2, h3, h4, h5, h6 { color: #f4f4f5; }
+div, p, span, label { color: #e5e7eb; }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("Dashboard de Consumo Energético por Región - Brasil")
 st.caption("Backend: FastAPI • Frontend: Streamlit • Datos: Excel oficial por regiones")
 
 # ============================
-# FUNCIONES AUXILIARES
+# FUNCIONES AUXILIARES (API)
 # ============================
 @st.cache_data
 def get_regiones():
@@ -37,293 +82,459 @@ def get_regiones():
     return resp.json()["regioes"]
 
 @st.cache_data
+def get_setores():
+    resp = requests.get(f"{API_URL}/catalogos/setores-industriais", timeout=30)
+    resp.raise_for_status()
+    return resp.json()["setores"]
+
+@st.cache_data
 def get_datos_industrial():
     resp = requests.get(f"{API_URL}/consumo/datos-industrial", timeout=60)
     resp.raise_for_status()
-    df = pd.DataFrame(resp.json())
+    return resp.json()
 
-    if "DataExcel" in df.columns:
-        df["DataExcel"] = pd.to_datetime(df["DataExcel"], errors="coerce")
-        df = df.dropna(subset=["DataExcel"])
-        df["Ano"] = df["DataExcel"].dt.year
-        df["Mes"] = df["DataExcel"].dt.month
-        df["AnoMes"] = df["DataExcel"].dt.to_period("M").astype(str)
-
-    return df
-
-def generar_qr(url: str) -> BytesIO:
-    img = qrcode.make(url)
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
-
+# ============================
+# FUNCIONES AUXILIARES (GeoJSON)
+# ============================
 @st.cache_data
 def load_geojson(path: str):
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 # ============================
+# FUNCIONES AUXILIARES (QR)
+# ============================
+def generar_qr(url: str) -> bytes:
+    img = qrcode.make(url)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+# ============================
+# FUNCIONES AUXILIARES (PDF)
+# ============================
+def fig_to_png_bytes(fig, scale=2) -> bytes:
+    return fig.to_image(format="png", scale=scale)
+
+def build_pdf_report(titulo: str, filtros: dict, figs: list, tabla_df=None) -> bytes:
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+
+    y = height - 0.8 * inch
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(0.8 * inch, y, titulo)
+
+    y -= 0.4 * inch
+    c.setFont("Helvetica", 10)
+    c.drawString(0.8 * inch, y, "Filtros aplicados:")
+    y -= 0.2 * inch
+    for k, v in filtros.items():
+        c.drawString(1.0 * inch, y, f"- {k}: {v}")
+        y -= 0.18 * inch
+
+    if tabla_df is not None and not tabla_df.empty:
+        y -= 0.1 * inch
+        c.drawString(0.8 * inch, y, f"Registros incluidos: {len(tabla_df):,}")
+        y -= 0.3 * inch
+
+    c.showPage()
+
+    for idx, (name, fig) in enumerate(figs, start=1):
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(0.8 * inch, height - 0.8 * inch, f"{idx}. {name}")
+
+        img_bytes = fig_to_png_bytes(fig, scale=2)
+        img = ImageReader(BytesIO(img_bytes))
+
+        img_w = width - 1.6 * inch
+        img_h = 6.2 * inch
+        x0 = 0.8 * inch
+        y0 = height - 1.2 * inch - img_h
+
+        c.drawImage(img, x0, y0, width=img_w, height=img_h, preserveAspectRatio=True, anchor="c")
+        c.showPage()
+
+    c.save()
+    buffer.seek(0)
+    return buffer.getvalue()
+
+# ============================
 # CARGA DE DATOS
 # ============================
-with st.spinner("Cargando datos desde la API..."):
-    try:
-        regiones = get_regiones()
-        df = get_datos_industrial()
-    except Exception as e:
-        st.error("No se pudo conectar a la API.")
-        st.exception(e)
-        st.stop()
+try:
+    regiones = get_regiones()
+    setores_api = get_setores()
+    data = get_datos_industrial()
+    df = pd.DataFrame(data)
+
+    if "DataExcel" in df.columns:
+        df["DataExcel"] = pd.to_datetime(df["DataExcel"], errors="coerce")
+    if "Consumo" in df.columns:
+        df["Consumo"] = pd.to_numeric(df["Consumo"], errors="coerce").fillna(0)
+
+except Exception as e:
+    st.error("No se pudo conectar a la API o cargar los datos.")
+    st.exception(e)
+    st.stop()
 
 # ============================
 # SIDEBAR
 # ============================
 st.sidebar.header("Filtros")
 
-region_sel = st.sidebar.selectbox("Seleccione una región:", regiones)
+region_sel = st.sidebar.selectbox("Seleccione una región:", ["(Todas)"] + regiones)
 
-sector_sel = st.sidebar.selectbox(
-    "Filtrar por sector:",
-    ["(Todos)"] + sorted(df["SetorIndustrial"].dropna().unique())
-)
+sectores_df = sorted(df["SetorIndustrial"].dropna().unique().tolist()) if "SetorIndustrial" in df.columns else []
+sectores = sorted(set(setores_api) | set(sectores_df))
+sector_sel = st.sidebar.selectbox("Filtrar por sector:", ["(Todos)"] + sectores)
 
-df_region = df[df["Regiao"] == region_sel].copy()
-if sector_sel != "(Todos)":
-    df_region = df_region[df_region["SetorIndustrial"] == sector_sel]
-
-st.sidebar.markdown(f"**Registros filtrados:** {len(df_region)}")
-
-# ============================
-# SECCIÓN 1: TABLA + MÉTRICAS
-# ============================
-st.subheader(f"📋 Datos filtrados - {region_sel}")
-
-with st.expander("Ver tabla de datos filtrados"):
-    st.dataframe(df_region, use_container_width=True)
-
-if not df_region.empty:
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Media", f"{df_region['Consumo'].mean():,.2f} MWh")
-    c2.metric("Mediana", f"{df_region['Consumo'].median():,.2f} MWh")
-    c3.metric("Desviación", f"{df_region['Consumo'].std():,.2f}")
-    c4.metric("Mínimo", f"{df_region['Consumo'].min():,.2f} MWh")
-    c5.metric("Máximo", f"{df_region['Consumo'].max():,.2f} MWh")
+if "DataExcel" in df.columns and df["DataExcel"].notna().any():
+    min_date = df["DataExcel"].min().date()
+    max_date = df["DataExcel"].max().date()
+    date_range = st.sidebar.date_input("Rango de fechas:", (min_date, max_date))
 else:
-    st.warning("No hay datos para los filtros seleccionados.")
+    date_range = None
 
-st.markdown("---")
+# ============================
+# FILTRADO PRINCIPAL
+# ============================
+df_filtrado = df.copy()
+
+if region_sel != "(Todas)" and "Regiao" in df_filtrado.columns:
+    df_filtrado = df_filtrado[df_filtrado["Regiao"] == region_sel]
+
+if sector_sel != "(Todos)" and "SetorIndustrial" in df_filtrado.columns:
+    df_filtrado = df_filtrado[df_filtrado["SetorIndustrial"] == sector_sel]
+
+if date_range and "DataExcel" in df_filtrado.columns:
+    d1, d2 = date_range
+    df_filtrado = df_filtrado[
+        (df_filtrado["DataExcel"].dt.date >= d1) &
+        (df_filtrado["DataExcel"].dt.date <= d2)
+    ]
+
+# ============================
+# SECCIÓN 1: TABLA + KPIs + ESTADÍSTICAS
+# ============================
+colA, colB, colC = st.columns([2, 1, 1])
+
+with colA:
+    st.subheader("📋 Datos filtrados")
+    st.dataframe(df_filtrado, width="stretch", height=320)
+
+with colB:
+    st.subheader("📌 KPIs")
+    st.metric("Registros", f"{len(df_filtrado):,}")
+    if "Consumo" in df_filtrado.columns:
+        st.metric("Consumo total", fmt_energia(float(df_filtrado["Consumo"].sum())))
+
+with colC:
+    st.subheader(f"📉 Estadísticas (Consumo en {unidad_txt()})")
+    if "Consumo" in df_filtrado.columns and not df_filtrado.empty:
+        s = df_filtrado["Consumo"].dropna()
+        if len(s) > 0:
+            media = float(s.mean())
+            mediana = float(s.median())
+            std = float(s.std())
+            minimo = float(s.min())
+            maximo = float(s.max())
+
+            cC1, cC2 = st.columns(2)
+            cC1.metric("Media", fmt_energia(media))
+            cC2.metric("Mediana", fmt_energia(mediana))
+
+            cC3, cC4 = st.columns(2)
+            cC3.metric("Desv. Estándar", fmt_energia(std))
+            cC4.metric("Mínimo", fmt_energia(minimo))
+
+            st.metric("Máximo", fmt_energia(maximo))
+        else:
+            st.info("No hay valores numéricos para calcular estadísticas.")
+    else:
+        st.info("No hay datos para estadísticas.")
 
 # ============================
 # SECCIÓN 2: GRÁFICAS
 # ============================
-st.subheader("📊 Visualizaciones del consumo")
+st.subheader("Visualizaciones")
 
-if df_region.empty:
-    st.info("Ajusta los filtros para ver gráficos.")
-else:
-    col1, col2 = st.columns(2)
+fig_barras = None
+fig_pie = None
+fig_hist = None
+fig_scatter = None
+fig_map = None
 
-    with col1:
-        st.markdown("#### Histograma de consumo")
-        fig_hist = px.histogram(df_region, x="Consumo", nbins=30)
-        st.plotly_chart(fig_hist, use_container_width=True)
+c1, c2 = st.columns(2)
 
-    with col2:
-        st.markdown("#### Participación por Sector Industrial")
-
-        df_pie = (
-            df_region.groupby("SetorIndustrial", as_index=False)["Consumo"]
+with c1:
+    if not df_filtrado.empty and "SetorIndustrial" in df_filtrado.columns and "Consumo" in df_filtrado.columns:
+        df_bar = (
+            df_filtrado.groupby("SetorIndustrial", as_index=False)["Consumo"]
             .sum()
             .sort_values("Consumo", ascending=False)
         )
 
-        if df_pie.empty or df_pie["Consumo"].sum() == 0:
-            st.info("No hay datos suficientes para la torta.")
-        else:
-            total = df_pie["Consumo"].sum()
-            df_pie["pct"] = (df_pie["Consumo"] / total) * 100
-            df_pie["Consumo_fmt"] = df_pie["Consumo"].map(lambda x: f"{x:,.2f} MWh")
-            df_pie["pct_fmt"] = df_pie["pct"].map(lambda x: f"{x:.1f}%")
+        df_bar_plot = df_bar.copy()
+        df_bar_plot["Consumo"] = energia_display_series(df_bar_plot["Consumo"])
 
-            fig_pie = px.pie(
-                df_pie,
-                values="Consumo",
-                names="SetorIndustrial",
-                hole=0.55,
-            )
-
-            # Nombres SOLO en la tarjeta (hover)
-            fig_pie.update_traces(
-                customdata=df_pie[["Consumo_fmt", "pct_fmt"]].to_numpy(),
-                hovertemplate=(
-                    "<b>%{label}</b><br>"
-                    "%{customdata[0]}<br>"
-                    "(%{customdata[1]})"
-                    "<extra></extra>"
-                ),
-                textinfo="none"
-            )
-            fig_pie.update_layout(showlegend=False)
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-            with st.expander("Sectores detalles"):
-                st.dataframe(
-                    df_pie[["SetorIndustrial", "Consumo", "pct"]]
-                    .rename(columns={
-                        "SetorIndustrial": "Sector",
-                        "Consumo": "Consumo (MWh)",
-                        "pct": "% participación"
-                    })
-                    .style.format({
-                        "Consumo (MWh)": "{:,.2f}",
-                        "% participación": "{:.1f}%"
-                    }),
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-    st.markdown("---")
-
-    col3, col4 = st.columns(2)
-
-    with col3:
-        st.markdown("#### Consumo total por año")
-        df_bar = df_region.groupby("Ano", as_index=False)["Consumo"].sum()
-        fig_bar = px.bar(df_bar, x="Ano", y="Consumo", text_auto=".2s")
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-    with col4:
-        st.markdown("#### Dispersión temporal del consumo")
-        fig_scatter = px.scatter(
-            df_region,
-            x="DataExcel",
+        fig_barras = px.bar(
+            df_bar_plot,
+            x="SetorIndustrial",
             y="Consumo",
             color="SetorIndustrial",
-            hover_data=["Regiao"]
+            color_discrete_sequence=SEQ,
+            title=f"Consumo por Sector Industrial ({unidad_txt()})",
+            template=TEMPLATE
         )
-        st.plotly_chart(fig_scatter, use_container_width=True)
+        fig_barras.update_layout(showlegend=False)
+        fig_barras.update_yaxes(title_text=f"Consumo ({unidad_txt()})")
+        st.plotly_chart(fig_barras, width="stretch")
+    else:
+        st.info("No hay datos para gráfica de barras.")
 
-# ============================
-# SECCIÓN 3: MAPA TIPO BRASIL (choropleth)
-# ============================
-st.subheader("🔥 Mapa de calor en Brasil (por ubicación)")
+with c2:
+    # TORTA + TARJETAS (sin texto en la torta)
+    if not df_filtrado.empty and "Consumo" in df_filtrado.columns:
+        if region_sel == "(Todas)":
+            if "Regiao" in df_filtrado.columns:
+                df_pie = df_filtrado.groupby("Regiao", as_index=False)["Consumo"].sum()
+                df_pie = df_pie.sort_values("Consumo", ascending=False).reset_index(drop=True)
 
-# IMPORTANTE:
-# - Este mapa requiere que tus datos tengan una columna que coincida con el GeoJSON.
-# - Con tu dataset actual, normalmente "Regiao" es macro-región, pero el geojson suele ser por estado (UF).
-# - Si NO tienes columna de estado (UF), solo podrás mapear por 5 macro-regiones con un geojson de macro-regiones.
+                df_pie_plot = df_pie.copy()
+                df_pie_plot["Consumo"] = energia_display_series(df_pie_plot["Consumo"])
 
-# Asumimos que tienes una columna en df llamada "UF" o "Estado" (ajústala aquí)
-COL_LOCATION = os.getenv("MAP_LOCATION_COL", "UF")  # cambia a "Estado" si así viene
+                fig_pie = px.pie(
+                    df_pie_plot,
+                    names="Regiao",
+                    values="Consumo",
+                    color="Regiao",
+                    color_discrete_sequence=SEQ2,
+                    title=f"Distribución de consumo por Región ({unidad_txt()})",
+                    template=TEMPLATE
+                )
+                fig_pie.update_traces(textinfo="none")
+                st.plotly_chart(fig_pie, width="stretch")
 
-if COL_LOCATION not in df.columns:
-    st.warning(
-        f"No puedo dibujar el mapa tipo Brasil porque NO existe la columna '{COL_LOCATION}' en tus datos.\n\n"
-        "Soluciones:\n"
-        "1) Cambia MAP_LOCATION_COL a una columna real (ej: Estado/UF).\n"
-        "2) O usa un GeoJSON por macro-regiones y mapea por 'Regiao'."
-    )
-else:
-    try:
-        geojson = load_geojson(GEOJSON_PATH)
+                st.markdown("#### 📌 Detalle por Región (tarjetas)")
+                total_mwh = float(df_pie["Consumo"].sum()) if not df_pie.empty else 0
 
-        # Agregado por ubicación (y filtros de sector si quieres)
-        df_map = df.copy()
-        if sector_sel != "(Todos)":
-            df_map = df_map[df_map["SetorIndustrial"] == sector_sel]
-
-        df_map = df_map.groupby(COL_LOCATION, as_index=False)["Consumo"].sum()
-        df_map = df_map.rename(columns={COL_LOCATION: "loc"})
-
-        # Bins (estilo leyenda por rangos como el ejemplo)
-        # Ajusta límites según tu escala real (aquí uso cuantiles para que se vea bien)
-        if df_map["Consumo"].sum() == 0 or df_map.empty:
-            st.info("No hay datos suficientes para el mapa.")
+                cols_cards = st.columns(3)
+                for i, row in df_pie.iterrows():
+                    nombre = str(row["Regiao"])
+                    consumo_mwh = float(row["Consumo"])
+                    pct = (consumo_mwh / total_mwh * 100) if total_mwh > 0 else 0
+                    with cols_cards[i % 3]:
+                        st.metric(
+                            label=nombre,
+                            value=fmt_energia(consumo_mwh),
+                            delta=f"{pct:.2f}% del total"
+                        )
+            else:
+                st.info("No existe la columna 'Regiao' para construir la torta por región.")
         else:
-            q = df_map["Consumo"].quantile([0, .1, .2, .3, .4, .5, .6, .7, .8, .9, 1]).values
-            q = sorted(set([float(x) for x in q]))
-            if len(q) < 4:
-                # pocos valores -> continuo
-                color_args = dict(color_continuous_scale="Viridis")
+            if "SetorIndustrial" in df_filtrado.columns:
+                df_pie_reg = df_filtrado.groupby("SetorIndustrial", as_index=False)["Consumo"].sum()
+                df_pie_reg = df_pie_reg.sort_values("Consumo", ascending=False).reset_index(drop=True)
+
+                df_pie_reg_plot = df_pie_reg.copy()
+                df_pie_reg_plot["Consumo"] = energia_display_series(df_pie_reg_plot["Consumo"])
+
+                fig_pie = px.pie(
+                    df_pie_reg_plot,
+                    names="SetorIndustrial",
+                    values="Consumo",
+                    color="SetorIndustrial",
+                    color_discrete_sequence=SEQ,
+                    title=f"Distribución de consumo por Sector en {region_sel} ({unidad_txt()})",
+                    template=TEMPLATE
+                )
+                fig_pie.update_traces(textinfo="none")
+                st.plotly_chart(fig_pie, width="stretch")
+
+                st.markdown(f"#### 📌 Detalle por Sector en {region_sel} (tarjetas)")
+                total_mwh = float(df_pie_reg["Consumo"].sum()) if not df_pie_reg.empty else 0
+
+                cols_cards = st.columns(3)
+                for i, row in df_pie_reg.iterrows():
+                    nombre = str(row["SetorIndustrial"])
+                    consumo_mwh = float(row["Consumo"])
+                    pct = (consumo_mwh / total_mwh * 100) if total_mwh > 0 else 0
+                    with cols_cards[i % 3]:
+                        st.metric(
+                            label=nombre,
+                            value=fmt_energia(consumo_mwh),
+                            delta=f"{pct:.2f}% del total"
+                        )
             else:
-                # discreto por bins
-                df_map["bin"] = pd.cut(df_map["Consumo"], bins=q, include_lowest=True)
-                color_args = dict(color="bin", color_discrete_sequence=px.colors.sequential.Viridis)
+                st.info("No existe la columna 'SetorIndustrial' para construir la torta por sector.")
+    else:
+        st.info("No hay datos para gráfica de torta.")
 
-            # Mapa (sin labels, y el detalle en hover)
-            # Para mapear: featureidkey debe coincidir con GEOJSON_KEY
-            if "bin" in df_map.columns:
-                fig_map = px.choropleth(
-                    df_map,
-                    geojson=geojson,
-                    locations="loc",
-                    featureidkey=GEOJSON_KEY,
-                    scope="south america",
-                    **color_args,
-                    hover_name="loc",
-                    hover_data={"Consumo": ":,.2f"},
-                )
-                # Hover tipo tarjeta
-                fig_map.update_traces(
-                    hovertemplate="<b>%{hovertext}</b><br>Consumo: %{customdata[0]:,.2f} MWh<extra></extra>"
-                )
-            else:
-                fig_map = px.choropleth(
-                    df_map,
-                    geojson=geojson,
-                    locations="loc",
-                    featureidkey=GEOJSON_KEY,
-                    scope="south america",
-                    color="Consumo",
-                    color_continuous_scale="Viridis",
-                    hover_name="loc",
-                    hover_data={"Consumo": ":,.2f"},
-                )
+c3, c4 = st.columns(2)
 
-            fig_map.update_geos(
-                fitbounds="locations",
-                visible=False
-            )
-            fig_map.update_layout(
-                margin=dict(l=0, r=0, t=0, b=0),
-                showlegend=True
-            )
+with c3:
+    if not df_filtrado.empty and "Consumo" in df_filtrado.columns:
+        df_hist_plot = df_filtrado.copy()
+        df_hist_plot["Consumo"] = energia_display_series(df_hist_plot["Consumo"])
 
-            st.plotly_chart(fig_map, use_container_width=True)
+        fig_hist = px.histogram(
+            df_hist_plot,
+            x="Consumo",
+            nbins=30,
+            title=f"Histograma del Consumo ({unidad_txt()})",
+            template=TEMPLATE
+        )
+        fig_hist.update_xaxes(title_text=f"Consumo ({unidad_txt()})")
+        st.plotly_chart(fig_hist, width="stretch")
+    else:
+        st.info("No hay datos para histograma.")
 
-            with st.expander("Ver datos usados para el mapa"):
-                st.dataframe(df_map, use_container_width=True)
+with c4:
+    if not df_filtrado.empty and "DataExcel" in df_filtrado.columns and "Consumo" in df_filtrado.columns:
+        df_sc = df_filtrado.dropna(subset=["DataExcel"]).sort_values("DataExcel").copy()
+        df_sc["Consumo"] = energia_display_series(df_sc["Consumo"])
 
-    except FileNotFoundError:
-        st.error(f"No encontré el GeoJSON en: {GEOJSON_PATH}. Colócalo ahí o ajusta GEOJSON_PATH.")
-    except Exception as e:
-        st.error("Error construyendo el mapa tipo Brasil.")
-        st.exception(e)
-
-st.markdown("---")
+        fig_scatter = px.scatter(
+            df_sc,
+            x="DataExcel",
+            y="Consumo",
+            color="Regiao" if "Regiao" in df_sc.columns else None,
+            color_discrete_sequence=SEQ2,
+            title=f"Consumo vs Fecha ({unidad_txt()})",
+            template=TEMPLATE
+        )
+        fig_scatter.update_yaxes(title_text=f"Consumo ({unidad_txt()})")
+        st.plotly_chart(fig_scatter, width="stretch")
+    else:
+        st.info("No hay datos para dispersión por fecha.")
 
 # ============================
-# SECCIÓN 4: DESCARGA
+# SECCIÓN 3: MAPA DE CALOR (por UF)
 # ============================
-st.subheader("📥 Descargar datos filtrados")
+st.subheader("Mapa de calor en Brasil (por ubicación)")
 
-if not df_region.empty:
-    st.download_button(
-        "Descargar CSV",
-        df_region.to_csv(index=False).encode("utf-8"),
-        file_name=f"datos_{region_sel}.csv",
-        mime="text/csv"
-    )
-else:
-    st.info("No hay datos para descargar.")
+try:
+    geojson = load_geojson(GEOJSON_PATH)
+
+    if df_filtrado.empty or "Regiao" not in df_filtrado.columns or "Consumo" not in df_filtrado.columns:
+        st.info("No hay datos suficientes para construir el mapa.")
+    else:
+        df_reg = df_filtrado.groupby("Regiao", as_index=False)["Consumo"].sum()
+
+        uf_to_regiao = {
+            "AC": "Norte", "AP": "Norte", "AM": "Norte", "PA": "Norte", "RO": "Norte", "RR": "Norte", "TO": "Norte",
+            "AL": "Nordeste", "BA": "Nordeste", "CE": "Nordeste", "MA": "Nordeste", "PB": "Nordeste", "PE": "Nordeste",
+            "PI": "Nordeste", "RN": "Nordeste", "SE": "Nordeste",
+            "DF": "Centro-Oeste", "GO": "Centro-Oeste", "MT": "Centro-Oeste", "MS": "Centro-Oeste",
+            "ES": "Sudeste", "MG": "Sudeste", "RJ": "Sudeste", "SP": "Sudeste",
+            "PR": "Sul", "RS": "Sul", "SC": "Sul",
+        }
+
+        df_uf = pd.DataFrame({"UF": list(uf_to_regiao.keys()), "Regiao": list(uf_to_regiao.values())}).merge(
+            df_reg, on="Regiao", how="left"
+        )
+        df_uf["Consumo"] = df_uf["Consumo"].fillna(0)
+
+        # Para el mapa, mostramos en unidad display también (GWh si aplica)
+        df_uf_plot = df_uf.copy()
+        df_uf_plot["Consumo"] = energia_display_series(df_uf_plot["Consumo"])
+
+        fig_map = px.choropleth(
+            df_uf_plot,
+            geojson=geojson,
+            locations="UF",
+            featureidkey=GEOJSON_KEY,
+            color="Consumo",
+            hover_name="UF",
+            hover_data={"Regiao": True, "Consumo": ":,.2f"},
+            color_continuous_scale="YlOrRd",
+            scope="south america",
+            template="plotly_white"
+        )
+
+        fig_map.update_geos(fitbounds="locations", visible=False, bgcolor="rgba(0,0,0,0)")
+        fig_map.update_layout(
+            height=820,
+            margin={"r": 0, "t": 0, "l": 0, "b": 0},
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+        )
+        fig_map.update_layout(coloraxis_colorbar_title=f"Consumo ({unidad_txt()})")
+
+        st.plotly_chart(fig_map, width="stretch")
+
+        with st.expander("Ver datos usados para el mapa (UF = estado)"):
+            st.dataframe(df_uf_plot, width="stretch")
+
+except FileNotFoundError:
+    st.error(f"No encontré el GeoJSON en: {GEOJSON_PATH}. Ajusta GEOJSON_PATH o coloca el archivo ahí.")
+except Exception as e:
+    st.error("Error construyendo el mapa de calor.")
+    st.exception(e)
+
+# ============================
+# SECCIÓN 4: DESCARGAS (CSV + PDF)
+# ============================
+st.subheader("📥 Descargar datos e informe")
+
+colD, colE = st.columns(2)
+
+with colD:
+    if not df_filtrado.empty:
+        st.download_button(
+            "⬇️ Descargar CSV (datos filtrados)",
+            df_filtrado.to_csv(index=False).encode("utf-8"),
+            file_name="datos_filtrados.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info("No hay datos filtrados para descargar CSV.")
+
+with colE:
+    st.write("Genera un PDF con las gráficas visibles del dashboard.")
+
+    filtros_reporte = {
+        "Región": region_sel,
+        "Sector": sector_sel,
+        "Fecha": f"{date_range[0]} a {date_range[1]}" if date_range else "N/A",
+        "Unidad": unidad_txt(),
+    }
+
+    figs_reporte = []
+    if fig_barras is not None: figs_reporte.append(("Consumo por Sector (Barras)", fig_barras))
+    if fig_pie is not None: figs_reporte.append(("Distribución (Torta)", fig_pie))
+    if fig_hist is not None: figs_reporte.append(("Histograma de Consumo", fig_hist))
+    if fig_scatter is not None: figs_reporte.append(("Consumo vs Fecha (Dispersión)", fig_scatter))
+    if fig_map is not None: figs_reporte.append(("Mapa de Calor (Brasil)", fig_map))
+
+    if figs_reporte:
+        try:
+            pdf_bytes = build_pdf_report(
+                titulo="Informe - Analizador de Consumo Energético",
+                filtros=filtros_reporte,
+                figs=figs_reporte,
+                tabla_df=df_filtrado
+            )
+
+            st.download_button(
+                label="⬇️ Descargar PDF con gráficas",
+                data=pdf_bytes,
+                file_name="informe_consumo_energetico.pdf",
+                mime="application/pdf"
+            )
+        except Exception as e:
+            st.error("No se pudo generar el PDF. Revisa kaleido y reportlab.")
+            st.exception(e)
+    else:
+        st.info("No hay figuras disponibles para incluir en el PDF (datos vacíos o filtros muy estrictos).")
 
 # ============================
 # SECCIÓN 5: QR
 # ============================
 st.subheader("🔳 Abrir dashboard desde el celular")
 
-qr = generar_qr(DASHBOARD_URL)
-st.image(qr, width=220)
-st.download_button("Descargar QR", qr, "dashboard_qr.png", "image/png")
+qr_bytes = generar_qr(DASHBOARD_URL)
+st.image(qr_bytes, width=220)
 
 st.success("✅ Dashboard cargado correctamente.")
