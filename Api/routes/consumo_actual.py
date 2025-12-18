@@ -4,26 +4,35 @@ import numpy as np
 import os
 
 router = APIRouter()
+
+# Ruta del Excel configurable por variable de entorno
 RUTA = os.getenv("EXCEL_PATH", "Dados_abertos_Consumo_Mensal.xlsx")
 
-# Cargar hojas
+# ============================
+# CARGA DE DATOS
+# ============================
+# Nota: se carga una vez al iniciar el servidor (rápido para consultas, pero consume RAM).
 df_ind = pd.read_excel(RUTA, sheet_name="SETOR INDUSTRIAL POR RG")
 df_sam = pd.read_excel(RUTA, sheet_name="CONSUMO E NUMCONS SAM")
 
+# Normaliza fechas
 df_ind["DataExcel"] = pd.to_datetime(df_ind["DataExcel"])
 df_sam["DataExcel"] = pd.to_datetime(df_sam["DataExcel"])
 
 # ============================
-# FUNCIONES
+# FUNCIONES DE APOYO
 # ============================
-
 def estadisticas(s):
+    """
+    Calcula estadísticos básicos de una Serie numérica:
+    media, mediana, desviación estándar, mínimo, máximo.
+    """
     return {
         "media": float(s.mean()),
         "mediana": float(s.median()),
         "desviacion": float(s.std()),
         "minimo": float(s.min()),
-        "maximo": float(s.max())
+        "maximo": float(s.max()),
     }
 
 # ============================
@@ -32,29 +41,39 @@ def estadisticas(s):
 
 @router.get("/actual/estadisticas-industrial")
 def estadisticas_industrial():
+    """Estadísticas globales del consumo industrial (toda la hoja)."""
     return estadisticas(df_ind["Consumo"])
 
 @router.get("/actual/serie-industrial")
 def serie_industrial():
+    """
+    Serie temporal agregada:
+    agrupa por fecha y suma el consumo total en esa fecha.
+    """
     g = df_ind.groupby("DataExcel")["Consumo"].sum().reset_index()
     return g.to_dict(orient="records")
 
 @router.get("/actual/picos-industrial")
 def picos_industrial():
+    """
+    Detecta picos anómalos (regla simple):
+    picos = valores > media + 2*desviación
+    Retorna registros completos que cumplen esa condición.
+    """
     m = df_ind["Consumo"].mean()
     d = df_ind["Consumo"].std()
-    p = df_ind[df_ind["Consumo"] > m + 2*d]
+    p = df_ind[df_ind["Consumo"] > m + 2 * d]
     return p.to_dict(orient="records")
 
 @router.get("/actual/estadisticas-sam")
 def estadisticas_sam():
+    """Estadísticas de consumo para la hoja SAM."""
     return estadisticas(df_sam["Consumo"])
 
 @router.get("/datos-industrial")
 def datos_industrial():
     """
-    Devuelve todos los registros crudos de la hoja
-    'SETOR INDUSTRIAL POR RG' para análisis en Streamlit.
+    Devuelve TODOS los registros crudos de la hoja
+    'SETOR INDUSTRIAL POR RG' para consumo en Streamlit.
     """
     return df_ind.to_dict(orient="records")
-
